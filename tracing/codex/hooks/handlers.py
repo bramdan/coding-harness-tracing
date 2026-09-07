@@ -7,7 +7,7 @@ for. When it fires, we locate the session's rollout JSONL at
 the full turn's data: user prompt, assistant message, token usage, and every
 tool call (shell, apply_patch, web_search, open_page) with structured args,
 output, and timing. We then ship one OTLP payload with the parent LLM span
-plus all TOOL child spans.
+plus TOOL child spans and non-tool exec context spans where appropriate.
 
 This replaces an earlier design that relied on Codex's lifecycle hooks
 (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop). Those hooks
@@ -111,6 +111,87 @@ def _iso_to_ms(ts: str) -> int:
         return 0
 
 
+def _mcp_completion(payload: dict, ts_ms: int) -> "dict | None":
+    """Read a structured MCP completion, without interpreting exec source text."""
+    invocation = payload.get("invocation")
+    if not isinstance(invocation, dict):
+        return None
+    server, tool = invocation.get("server"), invocation.get("tool")
+    if not isinstance(server, str) or not server or not isinstance(tool, str) or not tool:
+        return None
+
+    duration = payload.get("duration")
+    duration_ns = None
+    if isinstance(duration, dict):
+        secs, nanos = duration.get("secs"), duration.get("nanos")
+        if type(secs) is int and type(nanos) is int and secs >= 0 and 0 <= nanos < 1_000_000_000:
+            duration_ns = secs * 1_000_000_000 + nanos
+    end_ns = ts_ms * 1_000_000
+    start_ns = max(0, end_ns - (duration_ns or 0))
+    result = payload.get("result")
+    status = 0  # Missing/unrecognized result is not a confirmed success.
+    if isinstance(result, dict):
+        if "Err" in result:
+            status = 2
+        elif "Ok" in result:
+            ok = result["Ok"]
+            status = 2 if isinstance(ok, dict) and ok.get("isError") is True else 1
+    call_id = payload.get("call_id")
+    return {
+        "tool": f"{server}.{tool}",
+        "args": json.dumps(invocation.get("arguments"), ensure_ascii=False),
+        "output": json.dumps(result, ensure_ascii=False),
+        "call_id": call_id if isinstance(call_id, str) else "",
+        "start_ts": start_ns // 1_000_000 if ts_ms else 0,
+        "end_ts": ts_ms,
+        "start_ns": start_ns if ts_ms else None,
+        "end_ns": end_ns if ts_ms else None,
+        "duration_ns": duration_ns,
+        "status_code": status,
+        "mcp_server": server,
+        "mcp_tool": tool,
+        "decision": None,
+    }
+
+
+def _merge_mcp_calls(tool_calls: list) -> list:
+    """Prefer structured completions by call ID; conservatively label exec wrappers.
+
+    Completion events have no exec parent ID. Keep MCP spans directly under the
+    turn, even when their interval and record order fit exactly one closed exec.
+    Such an exec is a CHAIN, not an extra TOOL. Ambiguous/incomplete execs and
+    execs with no MCP completions retain their existing representation.
+    """
+    mcp_by_id: dict = {}
+    merged = []
+    for entry in tool_calls:
+        if entry.get("mcp_server") and entry.get("call_id"):
+            mcp_by_id.setdefault(entry["call_id"], entry)
+    for entry in tool_calls:
+        canonical = mcp_by_id.get(entry.get("call_id"))
+        if canonical is not None and canonical is not entry:
+            continue
+        merged.append(entry)
+
+    wrappers = [e for e in merged if e.get("_custom_exec") and "_end_record" in e]
+    for entry in merged:
+        if not entry.get("mcp_server") or entry.get("start_ns") is None or entry.get("duration_ns") is None:
+            continue
+        candidates = [
+            wrapper
+            for wrapper in wrappers
+            if wrapper["_record"] < entry["_record"] < wrapper["_end_record"]
+            and wrapper["start_ts"] * 1_000_000 <= entry["start_ns"]
+            and entry["end_ns"] <= wrapper["end_ts"] * 1_000_000
+        ]
+        if len(candidates) == 1:
+            candidates[0]["span_kind"] = "CHAIN"
+    for entry in merged:
+        for key in ("_record", "_end_record", "_custom_exec"):
+            entry.pop(key, None)
+    return merged
+
+
 def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None":
     """Walk the rollout JSONL and extract everything for one turn.
 
@@ -118,6 +199,8 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
     ``duration_ms``, ``user_prompt``, ``assistant_output``, ``model``, ``cwd``,
     ``permission_mode``, ``sandbox_mode``, ``token_usage`` (or None), and
     ``tool_calls`` (a list of ``{tool, args, output, call_id, start_ts, end_ts}``).
+    Structured MCP completions also carry server/tool identity, status, and
+    nanosecond duration/timestamps. Exec context entries may specify CHAIN kind.
 
     Returns None if the turn isn't found.
     """
@@ -154,7 +237,7 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
 
     try:
         with open(rollout_path, "r", encoding="utf-8") as f:
-            for line in f:
+            for record_index, line in enumerate(f):
                 line = line.strip()
                 if not line:
                     continue
@@ -198,6 +281,13 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                     continue
 
                 if not in_turn:
+                    continue
+
+                if outer == "event_msg" and ptype == "mcp_tool_call_end":
+                    entry = _mcp_completion(payload, ts_ms)
+                    if entry is not None:
+                        entry["_record"] = record_index
+                        tool_calls.append(entry)
                     continue
 
                 # task_complete: final assistant message + accurate timing
@@ -276,6 +366,8 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                         "start_ts": ts_ms,
                         "end_ts": ts_ms,
                         "decision": None,
+                        "_custom_exec": payload.get("name") in ("exec", "functions.exec"),
+                        "_record": record_index,
                     }
                     tool_calls.append(entry)
                     if call_id:
@@ -288,6 +380,7 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                     if pending is not None:
                         pending["output"] = payload.get("output") or ""
                         pending["end_ts"] = ts_ms or pending["end_ts"]
+                        pending["_end_record"] = record_index
                     continue
 
                 # Web search: web_search_end (event_msg, has call_id) is paired with
@@ -331,6 +424,8 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
 
     if not in_turn:
         return None
+
+    tool_calls = _merge_mcp_calls(tool_calls)
 
     if not turn_end_ms:
         candidates = [e["end_ts"] for e in tool_calls if e.get("end_ts")]
@@ -426,15 +521,22 @@ def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
     child_spans: list = []
     for entry in turn.get("tool_calls") or []:
         tool_name = entry.get("tool") or "unknown_tool"
+        span_kind = entry.get("span_kind") or "TOOL"
         args_raw = entry.get("args") or ""
         output_raw = entry.get("output") or ""
         tool_attrs: dict = {
-            "openinference.span.kind": "TOOL",
-            "tool.name": tool_name,
+            "openinference.span.kind": span_kind,
             "input.value": redact_content(env.log_tool_details, args_raw),
             "output.value": redact_content(env.log_tool_content, output_raw),
             "session.id": thread_id,
         }
+        if span_kind == "TOOL":
+            tool_attrs["tool.name"] = tool_name
+        if entry.get("mcp_server"):
+            tool_attrs["mcp.server.name"] = entry["mcp_server"]
+            tool_attrs["mcp.tool.name"] = entry["mcp_tool"]
+            if entry.get("duration_ns") is not None:
+                tool_attrs["codex.mcp.duration_ns"] = entry["duration_ns"]
         if cwd:
             tool_attrs["codex.cwd"] = cwd
         if workspace:
@@ -445,7 +547,7 @@ def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
         child_end = entry.get("end_ts") or child_start
         child = build_span(
             tool_name,
-            "TOOL",
+            span_kind,
             generate_span_id(),
             trace_id,
             parent_span_id,
@@ -454,7 +556,14 @@ def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
             tool_attrs,
             SERVICE_NAME,
             SCOPE_NAME,
+            status_code=entry.get("status_code", 1),
+            # Never copy raw error text outside the output redaction boundary.
+            status_message="MCP tool call failed" if entry.get("status_code") == 2 else "",
         )
+        if entry.get("start_ns") is not None and entry.get("end_ns") is not None:
+            span = child["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            span["startTimeUnixNano"] = str(entry["start_ns"])
+            span["endTimeUnixNano"] = str(entry["end_ns"])
         child_spans.append(child)
 
     parent_span = build_span(

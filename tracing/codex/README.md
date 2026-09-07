@@ -99,6 +99,32 @@ Without this one-time approval, hooks won't fire and traces will be limited to t
 
 ## Verifying tracing
 
+### Structured MCP completions in notify rollouts
+
+When the rollout contains `event_msg` / `mcp_tool_call_end`, the notify parser
+emits a TOOL span named `<server>.<tool>` using the recorded invocation, arguments,
+result and call ID. Tool names are preserved exactly, including underscores.
+`Err` results and successful MCP responses with `isError: true` produce error
+status. Missing/unrecognized results remain unset. Argument and result logging
+continue to follow `ARIZE_LOG_TOOL_DETAILS` and `ARIZE_LOG_TOOL_CONTENT`; status
+messages never contain raw error content.
+
+The completion timestamp anchors the end; a valid `{secs, nanos}` duration supplies
+the start. Nanosecond duration is preserved relative to the rollout timestamp's
+precision. Missing/invalid duration produces a zero-length interval. Duplicate
+representations with the same call ID emit one MCP span; calls without IDs are
+retained separately.
+
+MCP spans are children of the turn: these events do not identify their parent
+exec invocation. If both transcript order and the recorded interval fit exactly
+one completed custom `exec`, that exec is retained as a CHAIN context span rather
+than counted as another TOOL. Parallel MCP calls are all retained. Ambiguous or
+incomplete exec intervals, discovery-only exec calls and other tool types retain
+their existing tool representation. No JavaScript is parsed to infer execution.
+Older rollouts without structured MCP completions retain their existing behavior.
+
+### Fresh-session check
+
 Run any Codex command:
 
 ```bash
